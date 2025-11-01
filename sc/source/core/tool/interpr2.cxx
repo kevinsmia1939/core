@@ -17,7 +17,11 @@
  *   the License at http://www.apache.org/licenses/LICENSE-2.0 .
  */
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <memory>
+#include <vector>
 #include <interpre.hxx>
 
 #include <comphelper/string.hxx>
@@ -46,6 +50,7 @@
 #include <globalnames.hxx>
 #include <stlpool.hxx>
 #include <stlsheet.hxx>
+#include <global.hxx>
 #include <dpcache.hxx>
 
 #include <com/sun/star/sheet/DataPilotFieldFilter.hpp>
@@ -3401,11 +3406,6 @@ void ScInterpreter::ScEuroConvert()
 // local functions
 namespace {
 
-void lclSplitBlock( double& rfInt, sal_Int32& rnBlock, double fValue, double fSize )
-{
-    rnBlock = static_cast< sal_Int32 >( modf( (fValue + 0.1) / fSize, &rfInt ) * fSize + 0.1 );
-}
-
 /** Appends a digit (0 to 9) to the passed string. */
 void lclAppendDigit( OStringBuffer& rText, sal_Int32 nDigit )
 {
@@ -3444,7 +3444,7 @@ void lclAppendPow10( OStringBuffer& rText, sal_Int32 nDigit, sal_Int32 nPow10 )
 }
 
 /** Appends a block of 6 digits (value from 1 to 999,999) to the passed string. */
-void lclAppendBlock( OStringBuffer& rText, sal_Int32 nValue )
+void lclAppendBlock( OStringBuffer& rText, sal_Int32 nValue, bool bHasHigherBlocks, bool bIsSatang )
 {
     OSL_ENSURE( (1 <= nValue) && (nValue <= 999999), "lclAppendBlock - illegal value" );
     if( nValue >= 100000 )
@@ -3480,10 +3480,154 @@ void lclAppendBlock( OStringBuffer& rText, sal_Int32 nValue )
             rText.append( UTF8_TH_20 );
         rText.append( UTF8_TH_10 );
     }
+    bool bHasOutput = rText.getLength() > 0;
     if( (nTen > 0) && (nOne == 1) )
         rText.append( UTF8_TH_11 );
     else if( nOne > 0 )
-        lclAppendDigit( rText, nOne );
+    {
+        if( !bIsSatang && (nOne == 1) && (bHasOutput || bHasHigherBlocks) )
+            rText.append( UTF8_TH_11 );
+        else
+            lclAppendDigit( rText, nOne );
+    }
+}
+
+bool lclParseBahtTextString( const OUString& rInput, std::vector<sal_Int32>& rBlocks,
+        sal_Int32& rSatang, bool& rNegative )
+{
+    OUString aTrimmed = rInput.trim();
+    rBlocks.clear();
+    rSatang = 0;
+    rNegative = false;
+
+    if( aTrimmed.isEmpty() )
+        return true;
+
+    const LocaleDataWrapper& rLocaleData = ScGlobal::getLocaleData();
+    const OUString& rGroupSepStr = rLocaleData.getNumThousandSep();
+    const sal_Unicode cGroupSep = rGroupSepStr.isEmpty() ? 0 : rGroupSepStr[0];
+    const OUString& rDecSepStr = rLocaleData.getNumDecimalSep();
+    const sal_Unicode cDecSep = rDecSepStr.isEmpty() ? '.' : rDecSepStr[0];
+    const sal_Unicode cDecSepAlt = rLocaleData.getNumDecimalSepAlt().toChar();
+
+    OUStringBuffer aIntDigits;
+    OUStringBuffer aFracDigits;
+    bool bSeenDecimal = false;
+    bool bProcessedSign = false;
+    bool bSeenDigit = false;
+
+    for( sal_Int32 i = 0; i < aTrimmed.getLength(); ++i )
+    {
+        sal_Unicode c = aTrimmed[i];
+        if( c == u' ' || c == 0x00A0 )
+            continue;
+
+        if( (c == u'+' || c == u'-') )
+        {
+            if( bProcessedSign || bSeenDigit || bSeenDecimal )
+                return false;
+            bProcessedSign = true;
+            if( c == u'-' )
+                rNegative = true;
+            continue;
+        }
+
+        if( (c == cDecSep || c == cDecSepAlt || c == u'.') )
+        {
+            if( bSeenDecimal )
+                return false;
+            bSeenDecimal = true;
+            continue;
+        }
+
+        if( cGroupSep && c == cGroupSep )
+            continue;
+
+        if( c == u',' )
+            continue;
+
+        if( c >= u'0' && c <= u'9' )
+        {
+            bSeenDigit = true;
+            if( bSeenDecimal )
+                aFracDigits.append( c );
+            else
+                aIntDigits.append( c );
+            continue;
+        }
+
+        return false;
+    }
+
+    if( !bSeenDigit )
+        return false;
+
+    if( aIntDigits.isEmpty() )
+        aIntDigits.append( u'0' );
+
+    sal_Int32 nFirst = 0;
+    sal_Int32 nSecond = 0;
+    sal_Int32 nThird = 0;
+    if( aFracDigits.getLength() > 0 )
+    {
+        nFirst = aFracDigits[0] - u'0';
+        if( aFracDigits.getLength() > 1 )
+            nSecond = aFracDigits[1] - u'0';
+        if( aFracDigits.getLength() > 2 )
+            nThird = aFracDigits[2] - u'0';
+    }
+
+    rSatang = nFirst * 10 + nSecond;
+    bool bCarry = false;
+    if( aFracDigits.getLength() > 2 && nThird >= 5 )
+    {
+        ++rSatang;
+        if( rSatang >= 100 )
+        {
+            rSatang = 0;
+            bCarry = true;
+        }
+    }
+
+    if( bCarry )
+    {
+        for( sal_Int32 i = aIntDigits.getLength() - 1; i >= 0; --i )
+        {
+            sal_Unicode c = aIntDigits[i];
+            if( c == u'9' )
+                aIntDigits.setCharAt( i, u'0' );
+            else
+            {
+                aIntDigits.setCharAt( i, c + 1 );
+                bCarry = false;
+                break;
+            }
+        }
+        if( bCarry )
+            aIntDigits.insert( 0, u'1' );
+    }
+
+    OUString aInteger = aIntDigits.makeStringAndClear();
+    sal_Int32 nPos = 0;
+    while( nPos + 1 < aInteger.getLength() && aInteger[nPos] == u'0' )
+        ++nPos;
+    if( nPos > 0 )
+        aInteger = aInteger.copy( nPos );
+
+    sal_Int32 nLen = aInteger.getLength();
+    if( nLen == 0 )
+        aInteger = OUString(u"0");
+
+    while( nLen > 0 )
+    {
+        sal_Int32 nChunkLen = std::min<sal_Int32>( 6, nLen );
+        sal_Int32 nStart = nLen - nChunkLen;
+        sal_Int32 nValue = aInteger.copy( nStart, nChunkLen ).toInt32();
+        rBlocks.push_back( nValue );
+        nLen = nStart;
+    }
+
+    return true;
 }
 
 } // namespace
@@ -3491,68 +3635,125 @@ void lclAppendBlock( OStringBuffer& rText, sal_Int32 nValue )
 void ScInterpreter::ScBahtText()
 {
     sal_uInt8 nParamCount = GetByte();
-    if ( !MustHaveParamCount( nParamCount, 1 ) )
+    if( !MustHaveParamCount( nParamCount, 1 ) )
         return;
 
-    double fValue = GetDouble();
+    double fDouble = 0.0;
+    svl::SharedString aSharedString;
+    bool bDouble = GetDoubleOrString( fDouble, aSharedString );
     if( nGlobalError != FormulaError::NONE )
     {
-        PushError( nGlobalError);
+        PushError( nGlobalError );
         return;
     }
 
-    // sign
-    bool bMinus = fValue < 0.0;
-    fValue = std::abs( fValue );
-
-    // round to 2 digits after decimal point, fValue contains Satang as integer
-    fValue = ::rtl::math::approxFloor( fValue * 100.0 + 0.5 );
-
-    // split Baht and Satang
-    double fBaht = 0.0;
+    std::vector<sal_Int32> aBlocks;
     sal_Int32 nSatang = 0;
-    lclSplitBlock( fBaht, nSatang, fValue, 100.0 );
+    bool bNegative = false;
+    bool bParsed = false;
+
+    if( bDouble )
+    {
+        bNegative = fDouble < 0.0;
+        double fAbs = std::abs( fDouble );
+        double fRounded = ::rtl::math::approxFloor( fAbs * 100.0 + 0.5 );
+
+        if( fRounded < 0.0 || fRounded > static_cast<double>( std::numeric_limits<sal_uInt64>::max() ) )
+        {
+            SetError( FormulaError::IllegalArgument );
+            PushError( FormulaError::IllegalArgument );
+            return;
+        }
+
+        sal_uInt64 nTotal = static_cast<sal_uInt64>( fRounded + 0.5 );
+        nSatang = static_cast<sal_Int32>( nTotal % 100 );
+        sal_uInt64 nBaht = nTotal / 100;
+
+        while( nBaht > 0 )
+        {
+            aBlocks.push_back( static_cast<sal_Int32>( nBaht % 1000000ULL ) );
+            nBaht /= 1000000ULL;
+        }
+
+        bParsed = true;
+    }
+    else
+    {
+        bParsed = lclParseBahtTextString( aSharedString.getString(), aBlocks, nSatang, bNegative );
+    }
+
+    if( !bParsed )
+    {
+        SetError( FormulaError::IllegalArgument );
+        PushError( FormulaError::IllegalArgument );
+        return;
+    }
+
+    bool bHasBaht = false;
+    for( sal_Int32 nBlock : aBlocks )
+    {
+        if( nBlock != 0 )
+        {
+            bHasBaht = true;
+            break;
+        }
+    }
 
     OStringBuffer aText;
-
-    // generate text for Baht value
-    if( fBaht == 0.0 )
+    if( !bHasBaht )
     {
         if( nSatang == 0 )
             aText.append( UTF8_TH_0 );
     }
-    else while( fBaht > 0.0 )
+    else
     {
-        OStringBuffer aBlock;
-        sal_Int32 nBlock = 0;
-        lclSplitBlock( fBaht, nBlock, fBaht, 1.0e6 );
-        if( nBlock > 0 )
-            lclAppendBlock( aBlock, nBlock );
-        // add leading "million", if there will come more blocks
-        if( fBaht > 0.0 )
-            aBlock.insert( 0, UTF8_TH_1E6 );
+        std::vector<bool> aHasHigher( aBlocks.size(), false );
+        bool bAnyHigher = false;
+        for( size_t idx = aBlocks.size(); idx-- > 0; )
+        {
+            aHasHigher[idx] = bAnyHigher;
+            if( aBlocks[idx] > 0 )
+                bAnyHigher = true;
+        }
 
-        aText.insert(0, aBlock);
+        for( size_t i = 0; i < aBlocks.size(); ++i )
+        {
+            sal_Int32 nBlock = aBlocks[i];
+            if( nBlock > 0 )
+            {
+                OStringBuffer aBlock;
+                lclAppendBlock( aBlock, nBlock, aHasHigher[i], false );
+                aText.insert( 0, aBlock );
+            }
+            if( i + 1 < aBlocks.size() )
+                aText.insert( 0, UTF8_TH_1E6 );
+        }
     }
-    if (!aText.isEmpty())
+
+    if( !aText.isEmpty() )
         aText.append( UTF8_TH_BAHT );
 
-    // generate text for Satang value
     if( nSatang == 0 )
     {
-        aText.append( UTF8_TH_DOT0 );
+        if( !aText.isEmpty() )
+            aText.append( UTF8_TH_DOT0 );
+        else
+        {
+            aText.append( UTF8_TH_0 );
+            aText.append( UTF8_TH_BAHT );
+            aText.append( UTF8_TH_DOT0 );
+        }
     }
     else
     {
-        lclAppendBlock( aText, nSatang );
+        lclAppendBlock( aText, nSatang, false, true );
         aText.append( UTF8_TH_SATANG );
     }
 
-    // add the minus sign
-    if( bMinus )
+    if( bNegative )
         aText.insert( 0, UTF8_TH_MINUS );
 
-    PushString( OStringToOUString(aText, RTL_TEXTENCODING_UTF8) );
+    PushString( OStringToOUString( aText, RTL_TEXTENCODING_UTF8 ) );
 }
 
 void ScInterpreter::ScGetPivotData()
